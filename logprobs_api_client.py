@@ -6,8 +6,8 @@
 import math
 import json
 import requests
-from dataclasses import dataclass, field
 from typing import Optional
+from pydantic import BaseModel, Field, computed_field
 from openai import OpenAI
 
 # =============================================================================
@@ -20,9 +20,6 @@ MAX_TOKENS = 2048
 TEMPERATURE = 0.7
 TOP_P = 0.8
 
-# Logprobs Settings
-TOP_LOGPROBS = 5  # Number of top alternative tokens to return (1-20)
-
 # OpenAI-compatible client
 client = OpenAI(
     base_url=f"{BASE_URL}/v1",
@@ -31,33 +28,17 @@ client = OpenAI(
 
 
 # =============================================================================
-# Data Classes for Structured Logprobs Output
+# Pydantic Models for Structured Logprobs Output
 # =============================================================================
-@dataclass
-class TokenLogprob:
+class TokenLogprob(BaseModel):
     """Single token with its logprob and probability."""
     token: str
     logprob: float
-    probability: float  # exp(logprob)
+    probability: float = Field(description="exp(logprob) - the actual probability")
     
-    @classmethod
-    def from_logprob(cls, token: str, logprob: float) -> "TokenLogprob":
-        return cls(
-            token=token,
-            logprob=logprob,
-            probability=math.exp(logprob)
-        )
-
-
-@dataclass
-class TokenWithAlternatives:
-    """Token with its logprob and top alternative tokens."""
-    token: str
-    logprob: float
-    probability: float
-    alternatives: list[TokenLogprob] = field(default_factory=list)
-    
-    def confidence_percentile(self) -> str:
+    @computed_field
+    @property
+    def confidence_percent(self) -> str:
         """Return confidence as percentage string."""
         return f"{self.probability * 100:.1f}%"
     
@@ -68,13 +49,20 @@ class TokenWithAlternatives:
     def is_low_confidence(self, threshold: float = 0.3) -> bool:
         """Check if token probability is below threshold (uncertain)."""
         return self.probability < threshold
+    
+    @classmethod
+    def from_api(cls, token: str, logprob: float) -> "TokenLogprob":
+        return cls(
+            token=token,
+            logprob=logprob,
+            probability=math.exp(logprob)
+        )
 
 
-@dataclass
-class LogprobsResponse:
-    """Full response with logprobs data."""
+class LogprobsResponse(BaseModel):
+    """Full response with token-level confidence data."""
     content: str
-    tokens: list[TokenWithAlternatives]
+    tokens: list[TokenLogprob] = Field(default_factory=list)
     
     def mean_confidence(self) -> float:
         """Average probability across all tokens."""
@@ -82,20 +70,27 @@ class LogprobsResponse:
             return 0.0
         return sum(t.probability for t in self.tokens) / len(self.tokens)
     
-    def min_confidence_token(self) -> Optional[TokenWithAlternatives]:
+    def min_confidence_token(self) -> Optional[TokenLogprob]:
         """Find the least confident token in the response."""
         if not self.tokens:
             return None
         return min(self.tokens, key=lambda t: t.probability)
     
-    def low_confidence_tokens(self, threshold: float = 0.3) -> list[TokenWithAlternatives]:
+    def low_confidence_tokens(self, threshold: float = 0.3) -> list[TokenLogprob]:
         """Get all tokens below confidence threshold."""
         return [t for t in self.tokens if t.is_low_confidence(threshold)]
     
     def confidence_summary(self) -> dict:
         """Summary statistics of token confidences."""
         if not self.tokens:
-            return {"error": "No tokens"}
+            return {
+                "total_tokens": 0,
+                "mean_confidence": 0.0,
+                "min_confidence": 0.0,
+                "max_confidence": 0.0,
+                "low_confidence_count": 0,
+                "warning": "No logprobs returned - server may need --logits_all flag",
+            }
         
         probs = [t.probability for t in self.tokens]
         return {
@@ -116,7 +111,6 @@ def chat_with_logprobs(
     max_tokens: int = MAX_TOKENS,
     temperature: float = TEMPERATURE,
     top_p: float = TOP_P,
-    top_logprobs: int = TOP_LOGPROBS,
 ) -> LogprobsResponse:
     """
     Send a chat completion request and return logprobs for each token.
@@ -126,7 +120,6 @@ def chat_with_logprobs(
         max_tokens: Maximum tokens to generate
         temperature: Sampling temperature
         top_p: Nucleus sampling parameter
-        top_logprobs: Number of top alternative tokens to return
     
     Returns:
         LogprobsResponse with content and token-level probabilities
@@ -138,7 +131,7 @@ def chat_with_logprobs(
         temperature=temperature,
         top_p=top_p,
         logprobs=True,
-        top_logprobs=top_logprobs,
+        top_logprobs=1,  # Required by llama-cpp-python to return logprobs
     )
     
     content = response.choices[0].message.content or ""
@@ -147,23 +140,9 @@ def chat_with_logprobs(
     # Parse logprobs from response
     if response.choices[0].logprobs and response.choices[0].logprobs.content:
         for token_info in response.choices[0].logprobs.content:
-            # Main token
-            main_token = TokenWithAlternatives(
-                token=token_info.token,
-                logprob=token_info.logprob,
-                probability=math.exp(token_info.logprob),
-                alternatives=[],
+            tokens_data.append(
+                TokenLogprob.from_api(token_info.token, token_info.logprob)
             )
-            
-            # Top alternative tokens
-            if token_info.top_logprobs:
-                for alt in token_info.top_logprobs:
-                    if alt.token != token_info.token:  # Skip the main token
-                        main_token.alternatives.append(
-                            TokenLogprob.from_logprob(alt.token, alt.logprob)
-                        )
-            
-            tokens_data.append(main_token)
     
     return LogprobsResponse(content=content, tokens=tokens_data)
 
@@ -173,7 +152,6 @@ def chat_with_logprobs_raw(
     max_tokens: int = MAX_TOKENS,
     temperature: float = TEMPERATURE,
     top_p: float = TOP_P,
-    top_logprobs: int = TOP_LOGPROBS,
 ) -> dict:
     """
     Send a chat completion request and return raw JSON response with logprobs.
@@ -186,7 +164,7 @@ def chat_with_logprobs_raw(
         "temperature": temperature,
         "top_p": top_p,
         "logprobs": True,
-        "top_logprobs": top_logprobs,
+        "top_logprobs": 1,  # Required by llama-cpp-python to return logprobs
     }
     
     response = requests.post(
@@ -237,7 +215,7 @@ def print_logprobs_colored(response: LogprobsResponse):
     print("\n")
 
 
-def print_logprobs_detailed(response: LogprobsResponse, show_alternatives: bool = True):
+def print_logprobs_detailed(response: LogprobsResponse):
     """
     Print detailed logprobs information for each token.
     """
@@ -246,14 +224,7 @@ def print_logprobs_detailed(response: LogprobsResponse, show_alternatives: bool 
     print("=" * 60)
     
     for i, token_data in enumerate(response.tokens):
-        print(f"\n[{i+1}] Token: {repr(token_data.token)}")
-        print(f"    Logprob: {token_data.logprob:.4f}")
-        print(f"    Probability: {token_data.probability*100:.2f}%")
-        
-        if show_alternatives and token_data.alternatives:
-            print("    Alternatives:")
-            for alt in token_data.alternatives[:3]:  # Top 3 alternatives
-                print(f"      - {repr(alt.token)}: {alt.probability*100:.2f}%")
+        print(f"[{i+1}] {repr(token_data.token):20} → {token_data.probability*100:6.2f}% (logprob: {token_data.logprob:.4f})")
 
 
 def print_confidence_summary(response: LogprobsResponse):
@@ -274,12 +245,15 @@ def print_confidence_summary(response: LogprobsResponse):
     if min_token:
         print(f"\n  Least Confident Token: {repr(min_token.token)}")
         print(f"    Probability: {min_token.probability*100:.2f}%")
-        if min_token.alternatives:
-            print(f"    Top Alternative: {repr(min_token.alternatives[0].token)}")
 
 
 def print_low_confidence_tokens(response: LogprobsResponse, threshold: float = 0.3):
-    """Print tokens with low confidence that may need verification."""
+    """
+    Print tokens with low confidence that may need verification.
+    
+    Note: Logprobs show confidence in the CHOSEN token.
+    Low values may indicate temperature sampling picked a less-likely option.
+    """
     low_conf = response.low_confidence_tokens(threshold)
     
     print("\n" + "=" * 60)
@@ -291,10 +265,7 @@ def print_low_confidence_tokens(response: LogprobsResponse, threshold: float = 0
         return
     
     for token_data in low_conf:
-        print(f"\n  Token: {repr(token_data.token)}")
-        print(f"  Confidence: {token_data.probability*100:.2f}%")
-        if token_data.alternatives:
-            print(f"  Alternatives: {', '.join(repr(a.token) for a in token_data.alternatives[:3])}")
+        print(f"  • {repr(token_data.token):20} → {token_data.probability*100:.2f}%")
 
 
 # =============================================================================
@@ -360,7 +331,7 @@ def test_factual_logprobs():
     response = chat_with_logprobs(messages, max_tokens=20, temperature=0.0)
     
     print(f"\n📤 Content: {response.content}")
-    print_logprobs_detailed(response, show_alternatives=True)
+    print_logprobs_detailed(response)
     print_confidence_summary(response)
     
     return response
@@ -407,6 +378,104 @@ def test_raw_logprobs():
 
 
 # =============================================================================
+# Difficulty-Graded Tests: Easy, Medium, Hard
+# =============================================================================
+
+def test_easy_math():
+    """Test EASY: Simple arithmetic that should have very high confidence."""
+    print("\n" + "=" * 60)
+    print("🟢 TEST [EASY]: Simple Math")
+    print("=" * 60)
+    
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a calculator. Answer with just the number, nothing else."
+        },
+        {
+            "role": "user",
+            "content": "What is 20 multiplied by 5, then divided by 4?"
+        }
+    ]
+    
+    response = chat_with_logprobs(messages, max_tokens=20, temperature=0.1)
+    
+    print(f"\n📤 Content: {response.content}")
+    print(f"   Expected: 25")
+    print_logprobs_colored(response)
+    print_confidence_summary(response)
+    
+    return response
+
+
+def test_medium_reasoning():
+    """Test MEDIUM: Multi-step word problem requiring some reasoning."""
+    print("\n" + "=" * 60)
+    print("🟡 TEST [MEDIUM]: Multi-step Word Problem")
+    print("=" * 60)
+    
+    messages = [
+        {
+            "role": "system",
+            "content": "Solve the problem step by step, then give the final answer."
+        },
+        {
+            "role": "user",
+            "content": """A store has 3 shelves. Each shelf has 4 boxes. 
+Each box contains 5 items. If 10 items are sold, how many items remain?
+Think through this and give the final number."""
+        }
+    ]
+    
+    response = chat_with_logprobs(messages, max_tokens=200, temperature=0.3)
+    
+    print(f"\n📤 Content: {response.content}")
+    print(f"   Expected: 50 (3×4×5=60, 60-10=50)")
+    print_logprobs_colored(response)
+    print_confidence_summary(response)
+    print_low_confidence_tokens(response, threshold=0.5)
+    
+    return response
+
+
+def test_hard_logic_riddle():
+    """Test HARD: Logic riddle requiring deductive reasoning."""
+    print("\n" + "=" * 60)
+    print("🔴 TEST [HARD]: Logic Riddle")
+    print("=" * 60)
+    
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a logic expert. Reason carefully and give a definitive answer."
+        },
+        {
+            "role": "user",
+            "content": """Three people - Alice, Bob, and Carol - each have a different pet: 
+a cat, a dog, or a fish.
+
+Clues:
+1. Alice does not have the fish.
+2. Bob does not have the cat.
+3. Carol does not have the dog.
+4. The person with the cat is not Alice.
+
+Who has which pet? Give the answer in format: Alice-[pet], Bob-[pet], Carol-[pet]"""
+        }
+    ]
+    
+    response = chat_with_logprobs(messages, max_tokens=300, temperature=0.3)
+    
+    print(f"\n📤 Content: {response.content}")
+    print(f"   Expected: Alice-dog, Bob-fish, Carol-cat")
+    print_logprobs_colored(response)
+    print_confidence_summary(response)
+    print_low_confidence_tokens(response, threshold=0.5)
+    
+    return response
+
+
+# =============================================================================
 # Run All Tests
 # =============================================================================
 
@@ -415,14 +484,12 @@ if __name__ == "__main__":
     print("LOGPROBS API CLIENT - TOKEN CONFIDENCE ANALYSIS")
     print("🔬" * 30)
     print(f"\n📡 Base URL: {BASE_URL}")
-    print(f"📊 Top Logprobs: {TOP_LOGPROBS}")
+    print(f"📊 Using logprobs for token confidence")
     
     tests = [
-        ("Simple Logprobs", test_simple_logprobs),
-        ("Factual Knowledge", test_factual_logprobs),
-        ("Reasoning", test_reasoning_logprobs),
-        ("Uncertainty Detection", test_uncertainty_detection),
-        ("Raw JSON", test_raw_logprobs),
+        ("🟢 EASY - Simple Math", test_easy_math),
+        ("🟡 MEDIUM - Word Problem", test_medium_reasoning),
+        ("🔴 HARD - Logic Riddle", test_hard_logic_riddle),
     ]
     
     results = {}

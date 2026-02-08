@@ -16,9 +16,12 @@ from openai import OpenAI
 BASE_URL = "https://curtate-unkeeled-sam.ngrok-free.dev"  # <-- Your ngrok URL
 
 # Generation Defaults
-MAX_TOKENS = 2048
+MAX_TOKENS = 16384
 TEMPERATURE = 0.7
 TOP_P = 0.8
+TOP_K = 20
+SEED = 42
+REPETITION_PENALTY = 1.05
 
 # OpenAI-compatible client
 client = OpenAI(
@@ -111,6 +114,9 @@ def chat_with_logprobs(
     max_tokens: int = MAX_TOKENS,
     temperature: float = TEMPERATURE,
     top_p: float = TOP_P,
+    top_k: int = TOP_K,
+    seed: int = SEED,
+    repetition_penalty: float = REPETITION_PENALTY,
 ) -> LogprobsResponse:
     """
     Send a chat completion request and return logprobs for each token.
@@ -120,6 +126,9 @@ def chat_with_logprobs(
         max_tokens: Maximum tokens to generate
         temperature: Sampling temperature
         top_p: Nucleus sampling parameter
+        top_k: Top-k sampling parameter
+        seed: Random seed for reproducibility
+        repetition_penalty: Penalty for repeated tokens
     
     Returns:
         LogprobsResponse with content and token-level probabilities
@@ -130,6 +139,11 @@ def chat_with_logprobs(
         max_tokens=max_tokens,
         temperature=temperature,
         top_p=top_p,
+        extra_body={
+            "top_k": top_k,
+            "seed": seed,
+            "repetition_penalty": repetition_penalty,
+        },
         logprobs=True,
         top_logprobs=1,  # Required by llama-cpp-python to return logprobs
     )
@@ -147,11 +161,145 @@ def chat_with_logprobs(
     return LogprobsResponse(content=content, tokens=tokens_data)
 
 
+def chat_with_logprobs_stream(
+    messages: list[dict],
+    max_tokens: int = MAX_TOKENS,
+    temperature: float = TEMPERATURE,
+    top_p: float = TOP_P,
+    top_k: int = TOP_K,
+    seed: int = SEED,
+    repetition_penalty: float = REPETITION_PENALTY,
+) -> LogprobsResponse:
+    """
+    Stream chat completion with real-time logprobs display.
+    
+    During streaming: prints each token with probability, e.g., "can(95.2%)"
+    After streaming: returns LogprobsResponse with pure content and all token data.
+    
+    Args:
+        messages: List of chat messages
+        max_tokens: Maximum tokens to generate
+        temperature: Sampling temperature
+        top_p: Nucleus sampling parameter
+        repetition_penalty: Penalty for repeated tokens
+    
+    Returns:
+        LogprobsResponse with content and token-level probabilities
+    """
+    import sys
+    
+    payload = {
+        "model": "qwen3-coder",
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "seed": seed,
+        "repetition_penalty": repetition_penalty,
+        "logprobs": True,
+        "top_logprobs": 1,
+        "stream": True,
+    }
+    
+    # Color codes for inline display
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    GREEN = "\033[92m"
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    
+    tokens_data = []
+    content_parts = []
+    
+    print(f"\n{BOLD}🔄 Streaming with Logprobs:{RESET}\n")
+    
+    response = requests.post(
+        f"{BASE_URL}/v1/chat/completions",
+        json=payload,
+        stream=True,
+        timeout=300,
+    )
+    response.raise_for_status()
+    
+    for line in response.iter_lines():
+        if not line:
+            continue
+        
+        line_str = line.decode("utf-8")
+        if not line_str.startswith("data: "):
+            continue
+        
+        data_str = line_str[6:]  # Remove "data: " prefix
+        if data_str.strip() == "[DONE]":
+            break
+        
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        
+        # Extract delta content and logprobs
+        choices = chunk.get("choices", [])
+        if not choices:
+            continue
+        
+        choice = choices[0]
+        delta = choice.get("delta", {})
+        token_text = delta.get("content", "")
+        
+        if not token_text:
+            continue
+        
+        content_parts.append(token_text)
+        
+        # Try to get logprobs from the chunk
+        logprobs_data = choice.get("logprobs")
+        if logprobs_data and logprobs_data.get("content"):
+            for token_info in logprobs_data["content"]:
+                token = token_info.get("token", token_text)
+                logprob = token_info.get("logprob", 0.0)
+                prob = math.exp(logprob)
+                
+                tokens_data.append(TokenLogprob.from_api(token, logprob))
+                
+                # Choose color based on confidence
+                if prob >= 0.8:
+                    color = GREEN
+                elif prob >= 0.4:
+                    color = YELLOW
+                else:
+                    color = RED
+                
+                # Print token with probability inline
+                token_display = token.replace("\n", "\\n")
+                print(f"{color}{token_display}{DIM}({prob*100:.1f}%){RESET}", end="", flush=True)
+        else:
+            # Fallback: print token without logprob if not available
+            print(f"{token_text}", end="", flush=True)
+    
+    print("\n")  # End streaming output
+    
+    full_content = "".join(content_parts)
+    
+    # Print the final pure output
+    print(f"{BOLD}📄 Final Output (Pure Text):{RESET}")
+    print("-" * 40)
+    print(full_content)
+    print("-" * 40)
+    
+    return LogprobsResponse(content=full_content, tokens=tokens_data)
+
+
 def chat_with_logprobs_raw(
     messages: list[dict],
     max_tokens: int = MAX_TOKENS,
     temperature: float = TEMPERATURE,
     top_p: float = TOP_P,
+    top_k: int = TOP_K,
+    seed: int = SEED,
+    repetition_penalty: float = REPETITION_PENALTY,
 ) -> dict:
     """
     Send a chat completion request and return raw JSON response with logprobs.
@@ -163,6 +311,9 @@ def chat_with_logprobs_raw(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
+        "top_k": top_k,
+        "seed": seed,
+        "repetition_penalty": repetition_penalty,
         "logprobs": True,
         "top_logprobs": 1,  # Required by llama-cpp-python to return logprobs
     }
@@ -377,6 +528,23 @@ def test_raw_logprobs():
     return raw_response
 
 
+def test_streaming_logprobs():
+    """Test: Streaming with real-time logprobs display."""
+    print("\n" + "=" * 60)
+    print("🧪 TEST: Streaming Logprobs")
+    print("=" * 60)
+    
+    messages = [
+        {"role": "user", "content": "Explain why the sky is blue in 2-3 sentences."}
+    ]
+    
+    response = chat_with_logprobs_stream(messages, max_tokens=100, temperature=0.3)
+    
+    print_confidence_summary(response)
+    
+    return response
+
+
 # =============================================================================
 # Difficulty-Graded Tests: Easy, Medium, Hard
 # =============================================================================
@@ -384,7 +552,7 @@ def test_raw_logprobs():
 def test_easy_math():
     """Test EASY: Simple arithmetic that should have very high confidence."""
     print("\n" + "=" * 60)
-    print("🟢 TEST [EASY]: Simple Math")
+    print("🟢 TEST [EASY]: Simple Math (Streaming)")
     print("=" * 60)
     
     messages = [
@@ -398,11 +566,9 @@ def test_easy_math():
         }
     ]
     
-    response = chat_with_logprobs(messages, max_tokens=20, temperature=0.1)
+    response = chat_with_logprobs_stream(messages)
     
-    print(f"\n📤 Content: {response.content}")
     print(f"   Expected: 25")
-    print_logprobs_colored(response)
     print_confidence_summary(response)
     
     return response
@@ -411,7 +577,7 @@ def test_easy_math():
 def test_medium_reasoning():
     """Test MEDIUM: Multi-step word problem requiring some reasoning."""
     print("\n" + "=" * 60)
-    print("🟡 TEST [MEDIUM]: Multi-step Word Problem")
+    print("🟡 TEST [MEDIUM]: Multi-step Word Problem (Streaming)")
     print("=" * 60)
     
     messages = [
@@ -427,11 +593,9 @@ Think through this and give the final number."""
         }
     ]
     
-    response = chat_with_logprobs(messages, max_tokens=200, temperature=0.3)
+    response = chat_with_logprobs_stream(messages)
     
-    print(f"\n📤 Content: {response.content}")
     print(f"   Expected: 50 (3×4×5=60, 60-10=50)")
-    print_logprobs_colored(response)
     print_confidence_summary(response)
     print_low_confidence_tokens(response, threshold=0.5)
     
@@ -441,7 +605,7 @@ Think through this and give the final number."""
 def test_hard_logic_riddle():
     """Test HARD: Logic riddle requiring deductive reasoning."""
     print("\n" + "=" * 60)
-    print("🔴 TEST [HARD]: Logic Riddle")
+    print("🔴 TEST [HARD]: Logic Riddle (Streaming)")
     print("=" * 60)
     
     messages = [
@@ -464,11 +628,9 @@ Who has which pet? Give the answer in format: Alice-[pet], Bob-[pet], Carol-[pet
         }
     ]
     
-    response = chat_with_logprobs(messages, max_tokens=300, temperature=0.3)
+    response = chat_with_logprobs_stream(messages)
     
-    print(f"\n📤 Content: {response.content}")
     print(f"   Expected: Alice-dog, Bob-fish, Carol-cat")
-    print_logprobs_colored(response)
     print_confidence_summary(response)
     print_low_confidence_tokens(response, threshold=0.5)
     

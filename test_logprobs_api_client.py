@@ -252,32 +252,51 @@ def chat_with_logprobs_stream(
         if not token_text:
             continue
         
-        content_parts.append(token_text)
-        
-        # Try to get logprobs from the chunk
+
         logprobs_data = choice.get("logprobs")
         if logprobs_data and logprobs_data.get("content"):
-            for token_info in logprobs_data["content"]:
-                token = token_info.get("token", token_text)
-                logprob = token_info.get("logprob", 0.0)
-                prob = math.exp(logprob)
+            # Only use the first token_info (the selected token)
+            token_info = logprobs_data["content"][0]
+            token = token_info.get("token", token_text)
+            logprob = token_info.get("logprob", 0.0)
+            prob = math.exp(logprob)
+            
+       
+            # Skip "Ghost Tokens": Placeholder chunks with extremely low logprobs (approx -25.16)
+            GHOST_THRESHOLD = 1e-6 # 0.0001%
+            if prob < GHOST_THRESHOLD and token_text.strip():
+                continue
                 
-                tokens_data.append(TokenLogprob.from_api(token, logprob))
-                
-                # Choose color based on confidence
-                if prob >= 0.8:
-                    color = GREEN
-                elif prob >= 0.4:
-                    color = YELLOW
-                else:
-                    color = RED
-                
-                # Print token with probability inline
-                token_display = token.replace("\n", "\\n")
-                print(f"{color}{token_display}{DIM}({prob*100:.1f}%){RESET}", end="", flush=True)
+            # Skip "Chunk Duplicates": Skip if this token text exactly matches 
+            # the last printed token text (arriving in a separate chunk)
+            if content_parts and token_text == content_parts[-1]:
+                # Update the logprob of the previous entry if this one is better
+                if tokens_data and tokens_data[-1].token == token:
+                    if logprob > tokens_data[-1].logprob:
+                        tokens_data[-1].logprob = logprob
+                        tokens_data[-1].probability = prob
+                continue
+            # --------------------------------------------------
+
+            tokens_data.append(TokenLogprob.from_api(token, logprob))
+            content_parts.append(token_text)
+            
+            # Choose color based on confidence
+            if prob >= 0.8:
+                color = GREEN
+            elif prob >= 0.4:
+                color = YELLOW
+            else:
+                color = RED
+            
+            # Print token with probability inline
+            token_display = token.replace("\n", "\\n")
+            print(f"{color}{token_display}{DIM}({prob*100:.1f}%){RESET}", end="", flush=True)
         else:
-            # Fallback: print token without logprob if not available
-            print(f"{token_text}", end="", flush=True)
+            # Fallback: print token without logprob if not already added
+            if not content_parts or token_text != content_parts[-1]:
+                print(f"{token_text}", end="", flush=True)
+                content_parts.append(token_text)
     
     print("\n")  # End streaming output
     
@@ -451,7 +470,7 @@ def test_reasoning_logprobs():
     messages = [
         {
             "role": "system",
-            "content": "Answer directly and concisely. No thinking tags."
+            "content": "Answer directly and concisely."
         },
         {
             "role": "user",
@@ -642,9 +661,9 @@ Who has which pet? Give the answer in format: Alice-[pet], Bob-[pet], Carol-[pet
 # =============================================================================
 
 if __name__ == "__main__":
-    print("\n" + "🔬" * 30)
+    print("\n" + "*" * 60)
     print("LOGPROBS API CLIENT - TOKEN CONFIDENCE ANALYSIS")
-    print("🔬" * 30)
+    print("*" * 60)
     print(f"\n📡 Base URL: {BASE_URL}")
     print(f"📊 Using logprobs for token confidence")
     

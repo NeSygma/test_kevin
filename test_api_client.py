@@ -20,7 +20,6 @@ TOP_K = 20
 REPETITION_PENALTY = 1.05
 
 # Display Settings
-SHOW_THINKING = True  # Set to False to hide <think> content
 USE_STREAMING = True  # Set to True to stream responses in real-time
 
 # OpenAI-compatible client
@@ -31,73 +30,8 @@ client = OpenAI(
 
 
 # =============================================================================
-# Helper: Parse thinking tags from response
+# Streaming and Non-Streaming Completions
 # =============================================================================
-import re
-
-# Thinking tag patterns (different models use different tags)
-THINK_OPEN_TAGS = ['<think>', '<thinking>']
-THINK_CLOSE_TAGS = ['</think>', '</thinking>']
-
-# For models that start thinking without explicit open tag (e.g., GLM with jinja template)
-ASSUME_THINKING_MODE = True  # Set to True for reasoning models that may omit opening tag
-
-
-def parse_thinking_response(content: str) -> tuple[str, str]:
-    """
-    Parse model response to separate thinking from output.
-    Supports both <think> and <thinking> tags.
-    
-    Returns:
-        (thinking, output) - thinking is empty string if no thinking tags found
-    """
-    # Try both patterns
-    think_pattern = r'<think(?:ing)?>(.*?)</think(?:ing)?>'
-    thinking_matches = re.findall(think_pattern, content, re.DOTALL)
-    thinking = '\n'.join(match.strip() for match in thinking_matches)
-    output = re.sub(think_pattern, '', content, flags=re.DOTALL).strip()
-    return thinking, output
-
-
-def print_response(content: str):
-    """Print response with thinking separated if present."""
-    thinking, output = parse_thinking_response(content)
-    
-    if thinking and SHOW_THINKING:
-        print(f"\n💭 Thinking:\n{'-' * 40}")
-        print(thinking[:500] + "..." if len(thinking) > 500 else thinking)
-        print(f"{'-' * 40}")
-    
-    print(f"\n📤 Output:")
-    print(output)
-
-
-def _is_think_open(content: str) -> bool:
-    """Check if content contains a thinking open tag."""
-    return any(tag in content for tag in THINK_OPEN_TAGS)
-
-
-def _is_think_close(content: str) -> bool:
-    """Check if content contains a thinking close tag."""
-    return any(tag in content for tag in THINK_CLOSE_TAGS)
-
-
-def _split_on_think_open(content: str) -> str:
-    """Split content on opening thinking tag and return part after."""
-    for tag in THINK_OPEN_TAGS:
-        if tag in content:
-            return content.split(tag)[-1]
-    return content
-
-
-def _split_on_think_close(content: str) -> tuple[str, str]:
-    """Split content on closing thinking tag, return (before, after)."""
-    for tag in THINK_CLOSE_TAGS:
-        if tag in content:
-            parts = content.split(tag)
-            return parts[0], parts[-1] if len(parts) > 1 else ''
-    return content, ''
-
 
 def stream_completion(messages: list, **kwargs) -> str:
     """
@@ -105,14 +39,7 @@ def stream_completion(messages: list, **kwargs) -> str:
     Returns the full content after streaming.
     """
     full_content = ""
-    in_thinking = ASSUME_THINKING_MODE  # Start in thinking mode if configured
-    started_output = False
-    printed_think_header = False
-    
-    # If assuming thinking mode, print header immediately
-    if ASSUME_THINKING_MODE and SHOW_THINKING:
-        print("\n[THINK]", flush=True)
-        printed_think_header = True
+    print("\n[RESULT]", flush=True)
     
     stream = client.chat.completions.create(
         model="qwen3-coder",
@@ -127,44 +54,9 @@ def stream_completion(messages: list, **kwargs) -> str:
         if chunk.choices[0].delta.content:
             content = chunk.choices[0].delta.content
             full_content += content
-            
-            # Handle thinking tags for display with block markers
-            if _is_think_open(content):
-                in_thinking = True
-                if SHOW_THINKING and not printed_think_header:
-                    print("\n[THINK]", flush=True)
-                    printed_think_header = True
-                # Print content after opening tag
-                after_tag = _split_on_think_open(content)
-                if after_tag and SHOW_THINKING:
-                    print(after_tag, end="", flush=True)
-            elif _is_think_close(content):
-                # Print content before closing tag
-                before_tag, after_tag = _split_on_think_close(content)
-                if before_tag and SHOW_THINKING:
-                    print(before_tag, end="", flush=True)
-                if printed_think_header and SHOW_THINKING:
-                    print("\n[/THINK]", flush=True)
-                in_thinking = False
-                # Start output section
-                if not started_output:
-                    print("\n[RESULT]", flush=True)
-                    started_output = True
-                # Print content after closing tag
-                if after_tag:
-                    print(after_tag, end="", flush=True)
-            else:
-                # Print token based on current state
-                if in_thinking and SHOW_THINKING:
-                    print(content, end="", flush=True)
-                elif not in_thinking:
-                    if not started_output and content.strip():
-                        print("\n[RESULT]", flush=True)
-                        started_output = True
-                    print(content, end="", flush=True)
+            print(content, end="", flush=True)
     
-    if started_output:
-        print("\n[/RESULT]", flush=True)
+    print("\n[/RESULT]", flush=True)
     
     return full_content
 
@@ -180,7 +72,7 @@ def non_stream_completion(messages: list, **kwargs) -> str:
         stream=False,
     )
     content = response.choices[0].message.content
-    print_response(content)
+    print(f"\n📤 Output:\n{content}")
     return content
 
 
@@ -378,9 +270,9 @@ First translate to formal logic, then reason step by step."""
 # =============================================================================
 
 if __name__ == "__main__":
-    print("\n" + "🚀" * 30)
+    print("\n" + "*" * 60)
     print("KAGGLE LLM SERVER - COMPREHENSIVE API TEST")
-    print("🚀" * 30)
+    print("*" * 60)
     print(f"\n📡 Base URL: {BASE_URL}")
     
     results = {}
@@ -408,17 +300,10 @@ if __name__ == "__main__":
     print("=" * 60)
     
     for name, result in results.items():
-        if result == "SKIP":
-            status = "⏭️  SKIP"
-        elif result:
-            status = "✅ PASS"
-        else:
-            status = "❌ FAIL"
+        status = "✅ PASS" if result else "❌ FAIL"
         print(f"  {status} - {name}")
     
-    passed_count = sum(1 for r in results.values() if r is True)
-    skip_count = sum(1 for r in results.values() if r == "SKIP")
-    fail_count = sum(1 for r in results.values() if r is False)
+    passed_count = sum(1 for r in results.values() if r)
     total_count = len(results)
-    print(f"\n  Total: {passed_count} passed, {skip_count} skipped, {fail_count} failed")
+    print(f"\n  Total: {passed_count}/{total_count} passed")
     print("=" * 60)
